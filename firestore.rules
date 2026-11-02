@@ -1,0 +1,132 @@
+rules_version = '2';
+// APAAR-Setu Firestore security rules: role-based access control mirroring src/data/scope.js.
+// While settings/meta does not exist (fresh project), the one-time setup screen may write seed data.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function seeding() { return !exists(/databases/$(database)/documents/settings/meta); }
+    function hasProfile() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function role() { return hasProfile() && me().active != false ? me().role : 'none'; }
+    function isAdmin() { return role() == 'aicte_admin'; }
+    function isRO() { return role() == 'regional_officer'; }
+    function isInst() { return role() == 'institution_admin' || role() == 'data_clerk'; }
+    function isInstAdmin() { return role() == 'institution_admin'; }
+    function isStudent() { return role() == 'student'; }
+    function isVerifier() { return role() == 'verifier'; }
+    function myInst() { return me().institutionId; }
+    function regionStates() {
+      return {
+        'WRO': ['Maharashtra', 'Gujarat'], 'SWRO': ['Karnataka'], 'SRO': ['Tamil Nadu'], 'SCRO': ['Telangana'],
+        'NRO': ['Uttar Pradesh'], 'CRO': ['Madhya Pradesh'], 'ERO': ['West Bengal']
+      }.get(me().region, []);
+    }
+    // Scope checks on an existing document (read/update) and on the incoming document (create/update).
+    function inScope(d) {
+      return isAdmin() || (isRO() && d.state in regionStates()) || (isInst() && d.institutionId == myInst());
+    }
+
+    // Public reference data
+    match /institutions/{id} {
+      allow read: if true;
+      allow create, delete: if seeding() || isAdmin();
+      allow update: if seeding() || isAdmin() || (isRO() && resource.data.state in regionStates());
+    }
+    match /programmes/{id} {
+      allow read: if true;
+      allow write: if seeding() || isAdmin();
+    }
+    match /publicStats/{id} {
+      allow read: if true;
+      allow write: if seeding() || isAdmin() || isRO() || (isInst() && id == myInst());
+    }
+    match /settings/{id} {
+      allow read: if true;
+      allow write: if seeding() || isAdmin() || (id == 'auditHead' && signedIn()) || (id == 'revocations' && isAdmin());
+    }
+
+    // People
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin() || (isInstAdmin() && resource.data.institutionId == myInst()));
+      allow create: if seeding() || isAdmin()
+        || (isInstAdmin() && request.resource.data.institutionId == myInst() && request.resource.data.role in ['data_clerk', 'institution_admin']);
+      allow update: if isAdmin()
+        || (request.auth.uid == uid && request.resource.data.role == resource.data.role && request.resource.data.institutionId == resource.data.institutionId)
+        || (isInstAdmin() && resource.data.institutionId == myInst() && request.resource.data.role in ['data_clerk', 'institution_admin']);
+      allow delete: if false;
+    }
+
+    // Student records
+    match /enrolments/{id} {
+      allow read: if inScope(resource.data) || (isStudent() && resource.data.apaarId == me().apaarId);
+      allow create: if seeding() || isAdmin() || (isInst() && request.resource.data.institutionId == myInst());
+      allow update: if seeding() || (inScope(resource.data) && inScope(request.resource.data));
+      allow delete: if false;
+    }
+    // Cross-institution index: which colleges hold an APAAR ID (no personal data). Needed for V04 checks.
+    match /apaarIndex/{apaarId} {
+      allow read: if hasProfile() && !isVerifier();
+      allow write: if seeding() || isAdmin() || isInst() || isRO();
+    }
+    match /batches/{id} {
+      allow read: if inScope(resource.data);
+      allow create: if seeding() || isAdmin() || (isInst() && request.resource.data.institutionId == myInst());
+      allow update: if seeding() || (inScope(resource.data) && inScope(request.resource.data));
+      allow delete: if false;
+    }
+    match /ledger/{id} {
+      allow read: if inScope(resource.data);
+      allow create: if seeding() || isAdmin() || isRO() || (isInst() && request.resource.data.institutionId == myInst());
+      allow update, delete: if false; // append-only
+    }
+    match /flags/{id} {
+      allow read: if inScope(resource.data);
+      allow create, update: if seeding() || isAdmin() || isRO() || (isInst() && request.resource.data.institutionId == myInst());
+      allow delete: if false;
+    }
+    match /scholarships/{id} {
+      allow read: if isAdmin() || (isRO() && resource.data.state in regionStates());
+      allow write: if seeding() || isAdmin() || isRO();
+    }
+
+    // Credentials and consent
+    match /credentials/{id} {
+      allow read: if isAdmin() || (isInst() && resource.data.institutionId == myInst()) || (isStudent() && resource.data.apaarId == me().apaarId);
+      allow create: if seeding() || isAdmin() || (isInstAdmin() && request.resource.data.institutionId == myInst()) || (isStudent() && request.resource.data.apaarId == me().apaarId);
+      allow update: if isAdmin() || (isInstAdmin() && resource.data.institutionId == myInst());
+      allow delete: if false;
+    }
+    match /consents/{id} {
+      allow read: if isAdmin() || (isStudent() && resource.data.apaarId == me().apaarId) || (signedIn() && resource.data.requesterId == request.auth.uid);
+      allow create: if seeding() || (isVerifier() && request.resource.data.requesterId == request.auth.uid);
+      allow update: if seeding() || isAdmin() || (isStudent() && resource.data.apaarId == me().apaarId && request.resource.data.requesterId == resource.data.requesterId);
+      allow delete: if false;
+    }
+    match /accessLog/{id} {
+      allow read: if isAdmin() || (isStudent() && resource.data.apaarId == me().apaarId) || (signedIn() && resource.data.actorId == request.auth.uid);
+      allow create: if seeding() || (signedIn() && request.resource.data.actorId == request.auth.uid);
+      allow update, delete: if false; // append-only
+    }
+
+    // Integrity
+    match /audit/{id} {
+      allow read: if isAdmin();
+      allow create: if seeding() || signedIn();
+      allow update, delete: if false; // append-only hash chain
+    }
+    match /merkle/{id} {
+      allow read: if isAdmin();
+      allow create: if seeding() || isAdmin();
+      allow update, delete: if false;
+    }
+    match /notifications/{id} {
+      function mine(d) {
+        return signedIn() && (isAdmin() || d.to == request.auth.uid
+          || (hasProfile() && (d.to == me().institutionId || d.to == me().region || d.to == 'apaar:' + me().apaarId)));
+      }
+      allow read, update: if mine(resource.data);
+      allow create: if seeding() || signedIn();
+      allow delete: if false;
+    }
+  }
+}
